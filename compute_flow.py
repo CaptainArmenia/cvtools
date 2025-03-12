@@ -25,7 +25,7 @@ def parse_args():
                         help='Width for inference (0=half of original size)')
     parser.add_argument('--visualization_width', type=int, default=1200, 
                         help='Width for visualization (0=original size)')
-    parser.add_argument('--min_magnitude', type=float, default=1.0,
+    parser.add_argument('--min_magnitude', type=float, default=0.5,
                         help='Minimum flow magnitude to visualize')
     parser.add_argument('--alpha', type=float, default=1.0,
                         help='Overlay opacity (0-1)')
