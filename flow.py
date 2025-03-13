@@ -9,6 +9,7 @@ from collections import deque
 import time
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
+import matplotlib.cm as cm
 
 # Fix potential warnings
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -37,6 +38,16 @@ def parse_args():
                         help='Sample every Nth pixel for flow lines (higher = less dense)')
     parser.add_argument('--line_thickness', type=int, default=1,
                         help='Thickness of flow lines')
+    parser.add_argument('--info', action='store_true',
+                        help='Display industrial monitoring information about scene dynamics')
+    parser.add_argument('--info_position', type=str, default='top-right',
+                        choices=['top-left', 'top-right', 'bottom-left', 'bottom-right', 
+                                'top-center', 'bottom-center', 'left-center', 'right-center'],
+                        help='Position for the information overlay')
+    parser.add_argument('--histogram_position', type=str, default='bottom-left',
+                        choices=['top-left', 'top-right', 'bottom-left', 'bottom-right', 
+                                'top-center', 'bottom-center', 'left-center', 'right-center'],
+                        help='Position for the direction histogram')
     return parser.parse_args()
 
 def preprocess(img_tensor):
@@ -322,6 +333,272 @@ def draw_flow_lines(frame, flow_lines, base_alpha=0.7, line_thickness=1):
     
     return result
 
+def calculate_scene_metrics(flow, min_magnitude=1.0):
+    """
+    Calculate quantitative metrics about the scene dynamics.
+    
+    Args:
+        flow: Optical flow matrix
+        min_magnitude: Minimum flow magnitude to consider
+    
+    Returns:
+        Dictionary of metrics
+    """
+    # Calculate flow magnitude
+    flow_magnitude = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+    
+    # Calculate basic statistics
+    active_pixels = flow_magnitude > min_magnitude
+    active_pixel_count = np.sum(active_pixels)
+    
+    # Calculate metrics only for active pixels
+    if active_pixel_count > 0:
+        mean_magnitude = np.mean(flow_magnitude[active_pixels])
+        max_magnitude = np.max(flow_magnitude[active_pixels])
+        median_magnitude = np.median(flow_magnitude[active_pixels])
+        std_magnitude = np.std(flow_magnitude[active_pixels])
+        
+        # Calculate flow direction (in degrees, 0-360)
+        flow_direction = np.zeros_like(flow_magnitude)
+        valid_flow = (flow_magnitude > min_magnitude)
+        if np.sum(valid_flow) > 0:
+            # Calculate direction in degrees (0-360) for valid flow vectors
+            flow_direction[valid_flow] = (np.degrees(np.arctan2(
+                flow[..., 1][valid_flow], flow[..., 0][valid_flow])) + 360) % 360
+            
+            # Calculate directional statistics
+            direction_histogram = np.zeros(8)  # 8 directional bins (N, NE, E, SE, S, SW, W, NW)
+            for i in range(8):
+                bin_min = i * 45
+                bin_max = (i + 1) * 45
+                bin_mask = (flow_direction >= bin_min) & (flow_direction < bin_max) & valid_flow
+                direction_histogram[i] = np.sum(bin_mask)
+                
+            # Normalize histogram
+            if np.sum(direction_histogram) > 0:
+                direction_histogram = direction_histogram / np.sum(direction_histogram)
+                
+            # Find primary direction
+            primary_dir_idx = np.argmax(direction_histogram)
+            primary_dir = primary_dir_idx * 45 + 22.5  # Center of bin
+            primary_dir_strength = direction_histogram[primary_dir_idx]
+        else:
+            direction_histogram = np.zeros(8)
+            primary_dir = 0
+            primary_dir_strength = 0
+            
+        # Calculate scene coverage
+        scene_coverage = active_pixel_count / flow_magnitude.size
+            
+        return {
+            'active_pixels': active_pixel_count,
+            'scene_coverage': scene_coverage,
+            'mean_magnitude': mean_magnitude,
+            'median_magnitude': median_magnitude,
+            'max_magnitude': max_magnitude,
+            'std_magnitude': std_magnitude,
+            'direction_histogram': direction_histogram,
+            'primary_direction': primary_dir,
+            'primary_direction_strength': primary_dir_strength
+        }
+    else:
+        # Return default values when no active pixels
+        return {
+            'active_pixels': 0,
+            'scene_coverage': 0,
+            'mean_magnitude': 0,
+            'median_magnitude': 0,
+            'max_magnitude': 0, 
+            'std_magnitude': 0,
+            'direction_histogram': np.zeros(8),
+            'primary_direction': 0,
+            'primary_direction_strength': 0
+        }
+
+def get_direction_name(angle):
+    """Convert angle in degrees to cardinal direction name."""
+    directions = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
+    idx = int(((angle + 22.5) % 360) / 45)
+    return directions[idx]
+
+def get_position_coordinates(position, frame_width, frame_height, element_width, element_height, margin=30):
+    """
+    Calculate coordinates for an element based on desired position on the frame.
+    
+    Args:
+        position: String describing position ('top-left', 'bottom-right', etc.)
+        frame_width: Width of the frame
+        frame_height: Height of the frame
+        element_width: Width of the element to position
+        element_height: Height of the element
+        margin: Margin from edges
+        
+    Returns:
+        (x, y) coordinates for top-left corner of the element
+    """
+    if position == 'top-left':
+        return margin, margin
+    elif position == 'top-right':
+        return frame_width - element_width - margin, margin
+    elif position == 'bottom-left':
+        return margin, frame_height - element_height - margin
+    elif position == 'bottom-right':
+        return frame_width - element_width - margin, frame_height - element_height - margin
+    elif position == 'top-center':
+        return (frame_width - element_width) // 2, margin
+    elif position == 'bottom-center':
+        return (frame_width - element_width) // 2, frame_height - element_height - margin
+    elif position == 'left-center':
+        return margin, (frame_height - element_height) // 2
+    elif position == 'right-center':
+        return frame_width - element_width - margin, (frame_height - element_height) // 2
+    else:
+        # Default to top-right if position not recognized
+        return frame_width - element_width - margin, margin
+
+def draw_info_overlay(frame, metrics, history_buffer=None, info_position='top-right', histogram_position='bottom-left'):
+    """
+    Draw industrial monitoring information overlay on the frame with customizable positions.
+    
+    Args:
+        frame: Input frame to draw on
+        metrics: Dictionary of scene metrics
+        history_buffer: Buffer of historical metrics for trends
+        info_position: Position for the data display
+        histogram_position: Position for the direction histogram
+    
+    Returns:
+        Frame with info overlay
+    """
+    h, w = frame.shape[:2]
+    
+    # Define common margin for all elements
+    common_margin = 30
+    
+    # Define dimensions for info panel
+    info_width = 380
+    info_height = 250
+    
+    # Calculate position for information panel
+    info_x, info_y = get_position_coordinates(
+        info_position, w, h, info_width, info_height, margin=common_margin
+    )
+    
+    # Ensure coordinates are integers
+    info_x, info_y = int(info_x), int(info_y)
+    
+    # Create semi-transparent dark background for readability
+    info_bg = frame.copy()
+    cv2.rectangle(info_bg, (info_x, info_y), (info_x + info_width, info_y + info_height), (0, 0, 0), -1)
+    frame = cv2.addWeighted(frame, 0.8, info_bg, 0.2, 0)
+    
+    # Use bright green for titles with better contrast
+    title_color = (50, 255, 120)  # Vibrant lime green in BGR
+    
+    # Draw title text with bolder weight for better visibility
+    title_text = "MONITORING DATA"
+    title_pos = (info_x + 20, info_y + 20)
+    cv2.putText(frame, title_text, title_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, title_color, 2)
+    
+    # Display motion metrics with pure white for better contrast
+    text_color = (255, 255, 255)
+    line_height = 30
+    y_pos = info_y + 50
+    
+    cv2.putText(frame, f"Active Motion Areas: {metrics['active_pixels']:,} pixels", 
+               (info_x + 20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    y_pos += line_height
+    
+    cv2.putText(frame, f"Scene Coverage: {metrics['scene_coverage']*100:.1f}%", 
+               (info_x + 20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    y_pos += line_height
+    
+    cv2.putText(frame, f"Mean Motion Rate: {metrics['mean_magnitude']:.2f} px/frame", 
+               (info_x + 20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    y_pos += line_height
+    
+    cv2.putText(frame, f"Max Motion Rate: {metrics['max_magnitude']:.2f} px/frame", 
+               (info_x + 20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    y_pos += line_height
+    
+    cv2.putText(frame, f"Motion Variation: {metrics['std_magnitude']:.2f} px/frame", 
+               (info_x + 20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    y_pos += line_height * 1.5
+    
+    # Draw direction information
+    direction_text = f"Primary Direction: {metrics['primary_direction']:.1f}° ({get_direction_name(metrics['primary_direction'])})"
+    direction_pos = (int(info_x + 20), int(y_pos))  # Ensure integers
+    cv2.putText(frame, direction_text, direction_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    y_pos += line_height
+    
+    cv2.putText(frame, f"Direction Confidence: {metrics['primary_direction_strength']*100:.1f}%", 
+               (int(info_x + 20), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    
+    # Draw direction histogram with customizable position
+    histogram = metrics['direction_histogram']
+    if np.sum(histogram) > 0:
+        # Define dimensions for histogram
+        hist_width = 220
+        hist_height = 100
+        title_height = 30  # Space for the title above the histogram
+        label_height = 30  # Space for labels below the histogram
+        
+        # Calculate total dimensions including title and label space
+        hist_total_height = hist_height + title_height + label_height
+        hist_total_width = hist_width + 20  # Add some extra width for margins
+        
+        # Calculate position for histogram with the same margin
+        hist_x, hist_y = get_position_coordinates(
+            histogram_position, w, h, hist_total_width, hist_total_height, margin=common_margin
+        )
+        
+        # Ensure coordinates are integers
+        hist_x, hist_y = int(hist_x), int(hist_y)
+        
+        # Adjust y position to account for the title space
+        hist_content_y = hist_y + title_height
+        
+        # Create semi-transparent dark background for the histogram - extend background size
+        hist_bg = frame.copy()
+        cv2.rectangle(hist_bg, 
+                     (hist_x, hist_y),  # Start from the calculated position with margin
+                     (hist_x + hist_width + 20, hist_y + hist_total_height), 
+                     (0, 0, 0), -1)
+        frame = cv2.addWeighted(frame, 0.8, hist_bg, 0.2, 0)
+        
+        # Add histogram title with proper positioning
+        histogram_title = "Motion Direction Distribution"
+        hist_title_pos = (hist_x + 10, hist_y + 20)  # Position title within its space
+        cv2.putText(frame, histogram_title, hist_title_pos, 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, title_color, 2)
+        
+        # Draw histogram background - positioned below the title
+        cv2.rectangle(frame, (hist_x + 5, hist_content_y), 
+                     (hist_x + 5 + hist_width, hist_content_y + hist_height), 
+                     (30, 30, 30), -1)
+        cv2.rectangle(frame, (hist_x + 5, hist_content_y), 
+                     (hist_x + 5 + hist_width, hist_content_y + hist_height), 
+                     (100, 100, 100), 1)
+        
+        # Draw histogram bars
+        bar_width = hist_width // 8
+        for i in range(8):
+            bar_height = int(histogram[i] * hist_height)
+            if bar_height > 0:
+                cv2.rectangle(frame, 
+                             (hist_x + 5 + i * bar_width, hist_content_y + hist_height - bar_height),
+                             (hist_x + 5 + (i + 1) * bar_width - 2, hist_content_y + hist_height),
+                             (50, 180, 250), -1)
+        
+        # Draw direction labels
+        direction_labels = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
+        for i, label in enumerate(direction_labels):
+            label_pos = (int(hist_x + 5 + i * bar_width + bar_width//2 - 5), 
+                        int(hist_content_y + hist_height + 15))
+            cv2.putText(frame, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1)
+    
+    return frame
+
 def main():
     args = parse_args()
     
@@ -391,6 +668,14 @@ def main():
     
     frame_count = 0
     start_time = time.time()
+    
+    # Extract info flags and position settings
+    info_mode = args.info if hasattr(args, 'info') else False
+    info_position = args.info_position if hasattr(args, 'info_position') else 'top-right'
+    histogram_position = args.histogram_position if hasattr(args, 'histogram_position') else 'bottom-left'
+    
+    # Initialize metrics history for trends
+    metrics_history = deque(maxlen=30)  # Store up to 30 frames of metrics
     
     print("Processing frames...")
     while True:
@@ -473,15 +758,18 @@ def main():
             line_thickness=args.line_thickness
         )
         
-        # Add frame counter and average flow magnitude (above threshold)
-        # cv2.putText(result, f"Frame: {frame_count}", (10, 30), 
-        #             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(result, f"Active Flow: {mean_flow:.2f} ({motion_percent:.1f}%)", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        # Add industrial monitoring info overlay if enabled
+        if info_mode:
+            scene_metrics = calculate_scene_metrics(flow, min_magnitude=args.min_magnitude)
+            metrics_history.append(scene_metrics)
+            result = draw_info_overlay(result, scene_metrics, metrics_history, 
+                                     info_position=info_position,
+                                     histogram_position=histogram_position)
         
-        # Write frame to output video
+        # Write frame to output video (only do this once)
         out.write(result)
         
+        # Display the frame (only do this once)
         cv2.imshow('Flow Visualization', result)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break

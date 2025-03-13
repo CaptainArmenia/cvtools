@@ -69,13 +69,25 @@ def parse_args():
                         help='Color scheme for speed visualization')
     parser.add_argument('--info', action='store_true',
                         help='Display industrial monitoring information about scene dynamics')
-    # Add new command-line arguments for flow lines
+    parser.add_argument('--info_position', type=str, default='top-right',
+                        choices=['top-left', 'top-right', 'bottom-left', 'bottom-right', 
+                                'top-center', 'bottom-center', 'left-center', 'right-center'],
+                        help='Position for the information overlay')
+    parser.add_argument('--histogram_position', type=str, default='bottom-left',
+                        choices=['top-left', 'top-right', 'bottom-left', 'bottom-right', 
+                                'top-center', 'bottom-center', 'left-center', 'right-center'],
+                        help='Position for the direction histogram')
+    # Add new command-line arguments for flow lines visualization
     parser.add_argument('--show_flow_lines', action='store_true',
-                        help='Show optical flow lines in active areas')
-    parser.add_argument('--line_density', type=int, default=16,
+                        help='Show optical flow lines across the entire frame')
+    parser.add_argument('--line_density', type=int, default=8,  # Changed from 16 to 8 to match flow.py
                         help='Density of flow lines (higher = fewer lines)')
     parser.add_argument('--line_thickness', type=int, default=1,
                         help='Thickness of flow lines')
+    parser.add_argument('--line_min_magnitude', type=float, default=0.3,  # Lowered from 0.5 to show more vectors
+                        help='Minimum flow magnitude to draw lines (can be lower than trail threshold)')
+    parser.add_argument('--line_scale', type=float, default=1.5,  # Reduced from 3.0 to make lines shorter
+                        help='Scale factor for flow line length')
     return parser.parse_args()
 
 def flow_to_color(magnitude, min_val=0, max_val=5, scheme='heat'):
@@ -510,7 +522,42 @@ def calculate_scene_metrics(flow, min_magnitude=1.0):
             'primary_direction_strength': 0
         }
 
-def draw_info_overlay(frame, metrics, history_buffer=None):
+def get_position_coordinates(position, frame_width, frame_height, element_width, element_height, margin=30):
+    """
+    Calculate coordinates for an element based on desired position on the frame.
+    
+    Args:
+        position: String describing position ('top-left', 'bottom-right', etc.)
+        frame_width: Width of the frame
+        frame_height: Height of the frame
+        element_width: Width of the element to position
+        element_height: Height of the element
+        margin: Margin from edges
+        
+    Returns:
+        (x, y) coordinates for top-left corner of the element
+    """
+    if position == 'top-left':
+        return margin, margin
+    elif position == 'top-right':
+        return frame_width - element_width - margin, margin
+    elif position == 'bottom-left':
+        return margin, frame_height - element_height - margin
+    elif position == 'bottom-right':
+        return frame_width - element_width - margin, frame_height - element_height - margin
+    elif position == 'top-center':
+        return (frame_width - element_width) // 2, margin
+    elif position == 'bottom-center':
+        return (frame_width - element_width) // 2, frame_height - element_height - margin
+    elif position == 'left-center':
+        return margin, (frame_height - element_height) // 2
+    elif position == 'right-center':
+        return frame_width - element_width - margin, (frame_height - element_height) // 2
+    else:
+        # Default to top-right if position not recognized
+        return frame_width - element_width - margin, margin
+
+def draw_info_overlay(frame, metrics, history_buffer=None, info_position='top-right', histogram_position='bottom-left'):
     """
     Draw industrial monitoring information overlay on the frame.
     
@@ -518,104 +565,138 @@ def draw_info_overlay(frame, metrics, history_buffer=None):
         frame: Input frame to draw on
         metrics: Dictionary of scene metrics
         history_buffer: Buffer of historical metrics for trends
+        info_position: Position for the data display
+        histogram_position: Position for the direction histogram
     
     Returns:
         Frame with info overlay
     """
     h, w = frame.shape[:2]
     
+    # Define common margin for all elements
+    common_margin = 30
+    
+    # Define dimensions for info panel
+    info_width = 380
+    info_height = 250
+    
+    # Calculate position for information panel
+    info_x, info_y = get_position_coordinates(
+        info_position, w, h, info_width, info_height, margin=common_margin
+    )
+    
+    # Ensure coordinates are integers
+    info_x, info_y = int(info_x), int(info_y)
+    
     # Create semi-transparent dark background for readability
     info_bg = frame.copy()
-    cv2.rectangle(info_bg, (w - 400, 20), (w - 20, 280), (0, 0, 0), -1)
+    cv2.rectangle(info_bg, (info_x, info_y), (info_x + info_width, info_y + info_height), (0, 0, 0), -1)
     frame = cv2.addWeighted(frame, 0.8, info_bg, 0.2, 0)
     
-    # Use an even brighter, more vivid green with better contrast
+    # Use bright green for titles with better contrast
     title_color = (50, 255, 120)  # Vibrant lime green in BGR
     
-    # Draw title text with bolder weight (thickness=2) instead of shadow
-    title_text = "INDUSTRIAL MONITORING DATA"
-    title_pos = (int(w - 380), 40)
-    
-    # Draw title with thicker line for better visibility
+    # Draw title text with bolder weight
+    title_text = "MONITORING DATA"
+    title_pos = (info_x + 20, info_y + 20)
     cv2.putText(frame, title_text, title_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, title_color, 2)
     
     # Display motion metrics with pure white
     text_color = (255, 255, 255)  # Pure white for better contrast
     line_height = 30
-    y_pos = 70
+    y_pos = info_y + 50
     
-    # Motion magnitude metrics - Use higher contrast white text
+    # Motion magnitude metrics
     cv2.putText(frame, f"Active Motion Areas: {metrics['active_pixels']:,} pixels", 
-               (int(w - 380), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+               (info_x + 20, int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
     y_pos += line_height
     
     cv2.putText(frame, f"Scene Coverage: {metrics['scene_coverage']*100:.1f}%", 
-               (int(w - 380), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+               (info_x + 20, int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
     y_pos += line_height
     
     cv2.putText(frame, f"Mean Motion Rate: {metrics['mean_magnitude']:.2f} px/frame", 
-               (int(w - 380), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+               (info_x + 20, int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
     y_pos += line_height
     
     cv2.putText(frame, f"Max Motion Rate: {metrics['max_magnitude']:.2f} px/frame", 
-               (int(w - 380), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+               (info_x + 20, int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
     y_pos += line_height
     
     cv2.putText(frame, f"Motion Variation: {metrics['std_magnitude']:.2f} px/frame", 
-               (int(w - 380), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+               (info_x + 20, int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
     y_pos += line_height * 1.5
     
-    # Draw direction information with better contrast
+    # Draw direction information
     direction_text = f"Primary Direction: {metrics['primary_direction']:.1f}° ({get_direction_name(metrics['primary_direction'])})"
-    direction_pos = (int(w - 380), int(y_pos))
+    direction_pos = (int(info_x + 20), int(y_pos))
     cv2.putText(frame, direction_text, direction_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
     y_pos += line_height
     
     cv2.putText(frame, f"Direction Confidence: {metrics['primary_direction_strength']*100:.1f}%", 
-               (int(w - 380), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
-    y_pos += line_height * 1.5
+               (int(info_x + 20), int(y_pos)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
     
-    # Draw direction histogram in the bottom left corner
+    # Draw direction histogram with customizable position
     histogram = metrics['direction_histogram']
     if np.sum(histogram) > 0:
-        # Draw histogram visualization - Move to bottom left
-        hist_width, hist_height = 220, 100
-        margin = 20  # Margin from the edge of the frame
-        hist_x, hist_y = int(margin), int(h - hist_height - margin - 25)  # 25 pixels extra for labels below
+        # Define dimensions for histogram
+        hist_width = 220
+        hist_height = 100
+        title_height = 30  # Space for the title above the histogram
+        label_height = 30  # Space for labels below the histogram
         
-        # Create semi-transparent dark background for the histogram
+        # Calculate total dimensions including title and label space
+        hist_total_height = hist_height + title_height + label_height
+        hist_total_width = hist_width + 20  # Add some extra width for margins
+        
+        # Calculate position for histogram with the same margin
+        hist_x, hist_y = get_position_coordinates(
+            histogram_position, w, h, hist_total_width, hist_total_height, margin=common_margin
+        )
+        
+        # Ensure coordinates are integers
+        hist_x, hist_y = int(hist_x), int(hist_y)
+        
+        # Adjust y position to account for the title space
+        hist_content_y = hist_y + title_height
+        
+        # Create semi-transparent dark background for the histogram - extend background size
         hist_bg = frame.copy()
-        cv2.rectangle(hist_bg, (hist_x - 10, hist_y - 30), (hist_x + hist_width + 10, hist_y + hist_height + 25), (0, 0, 0), -1)
+        cv2.rectangle(hist_bg, 
+                     (hist_x, hist_y),  # Start from the calculated position with margin
+                     (hist_x + hist_width + 20, hist_y + hist_total_height), 
+                     (0, 0, 0), -1)
         frame = cv2.addWeighted(frame, 0.8, hist_bg, 0.2, 0)
         
-        # Add histogram title with same approach - bold text without shadow
+        # Add histogram title with proper positioning
         histogram_title = "Motion Direction Distribution"
-        hist_title_pos = (hist_x, hist_y - 10)
-        
-        # Draw histogram title with thicker line
+        hist_title_pos = (hist_x + 10, hist_y + 20)  # Position title within its space
         cv2.putText(frame, histogram_title, hist_title_pos, 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, title_color, 2)
         
-        # Draw histogram background
-        cv2.rectangle(frame, (hist_x, hist_y), (hist_x + hist_width, hist_y + hist_height), (30, 30, 30), -1)
-        cv2.rectangle(frame, (hist_x, hist_y), (hist_x + hist_width, hist_y + hist_height), (100, 100, 100), 1)
+        # Draw histogram background - positioned below the title
+        cv2.rectangle(frame, (hist_x + 5, hist_content_y), 
+                     (hist_x + 5 + hist_width, hist_content_y + hist_height), 
+                     (30, 30, 30), -1)
+        cv2.rectangle(frame, (hist_x + 5, hist_content_y), 
+                     (hist_x + 5 + hist_width, hist_content_y + hist_height), 
+                     (100, 100, 100), 1)
         
         # Draw histogram bars
         bar_width = hist_width // 8
         for i in range(8):
             bar_height = int(histogram[i] * hist_height)
             if bar_height > 0:
-                # Fix: Ensure all coordinates are integers
                 cv2.rectangle(frame, 
-                             (hist_x + i * bar_width, hist_y + hist_height - bar_height),
-                             (hist_x + (i + 1) * bar_width - 2, hist_y + hist_height),
+                             (hist_x + 5 + i * bar_width, hist_content_y + hist_height - bar_height),
+                             (hist_x + 5 + (i + 1) * bar_width - 2, hist_content_y + hist_height),
                              (50, 180, 250), -1)
         
-        # Draw direction labels with better contrast
+        # Draw direction labels
         direction_labels = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
         for i, label in enumerate(direction_labels):
-            # Fix: Ensure all coordinates are integers
-            label_pos = (int(hist_x + i * bar_width + bar_width//2 - 5), int(hist_y + hist_height + 15))
+            label_pos = (int(hist_x + 5 + i * bar_width + bar_width//2 - 5), 
+                        int(hist_content_y + hist_height + 15))
             cv2.putText(frame, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1)
     
     return frame
@@ -626,70 +707,63 @@ def get_direction_name(angle):
     idx = int(((angle + 22.5) % 360) / 45)
     return directions[idx]
 
-def draw_flow_lines(frame, flow, magnitude_threshold=1.0, step=16, thickness=1, color=None, scale=1.0):
+def draw_flow_lines(frame, flow, min_magnitude=0.3, step=8, thickness=1, scale=1.5):
     """
     Draw optical flow lines on the frame at regular intervals.
+    Modified to better match flow.py's implementation with shorter lines and denser grid.
     
     Args:
         frame: Input frame to draw on
         flow: Optical flow matrix
-        magnitude_threshold: Minimum flow magnitude to draw
-        step: Spacing between flow lines
+        min_magnitude: Minimum flow magnitude to draw (lowered to show more vectors)
+        step: Spacing between flow lines (smaller value = denser grid)
         thickness: Thickness of flow lines
-        color: Optional fixed color for all lines (otherwise colored by direction)
-        scale: Scale factor for line length
-        
+        scale: Scale factor for line length (smaller value = shorter lines)
+    
     Returns:
-        Frame with flow lines
+        Frame with flow lines drawn
     """
     h, w = frame.shape[:2]
-    y_coords, x_coords = np.mgrid[step//2:h:step, step//2:w:step].reshape(2, -1).astype(int)
     
-    # Calculate flow magnitude
-    fx, fy = flow[..., 0], flow[..., 1]
-    flow_magnitude = np.sqrt(fx**2 + fy**2)
+    # Create a uniform grid of points to evaluate flow
+    y_grid, x_grid = np.mgrid[step//2:h:step, step//2:w:step]
     
-    # Create a copy of the frame to draw on
-    vis = frame.copy()
+    # Get flow at each grid point
+    fx = flow[..., 0][y_grid, x_grid]
+    fy = flow[..., 1][y_grid, x_grid]
     
-    # Draw flow lines
-    lines = []
-    for i, (x, y) in enumerate(zip(x_coords, y_coords)):
-        if 0 <= y < h and 0 <= x < w:
-            # Get flow at this point
-            flow_x = fx[y, x]
-            flow_y = fy[y, x]
-            magnitude = flow_magnitude[y, x]
+    # Calculate magnitude at each point
+    magnitude = np.sqrt(fx*fx + fy*fy)
+    
+    # Create a copy of the frame for drawing
+    visualization = frame.copy()
+    
+    # Draw a line for each grid point
+    for i in range(y_grid.shape[0]):
+        for j in range(y_grid.shape[1]):
+            x, y = int(x_grid[i, j]), int(y_grid[i, j])
+            flow_x, flow_y = fx[i, j], fy[i, j]
+            mag = magnitude[i, j]
             
-            # Only draw if above threshold
-            if magnitude >= magnitude_threshold:
-                # Calculate line end point
+            if mag >= min_magnitude:
+                # Calculate end point with shorter scale
                 end_x = int(x + flow_x * scale)
                 end_y = int(y + flow_y * scale)
                 
-                # Keep end point within frame bounds
+                # Constrain endpoints to be within frame
                 end_x = max(0, min(w-1, end_x))
                 end_y = max(0, min(h-1, end_y))
                 
-                # Add to list of lines to draw
-                lines.append(((x, y), (end_x, end_y), magnitude))
+                # Calculate color based on direction
+                angle = np.arctan2(flow_y, flow_x)
+                hue = (np.degrees(angle) + 180) / 360.0  # Map [-180, 180] to [0, 1]
+                rgb_color = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                line_color = (int(rgb_color[2] * 255), int(rgb_color[1] * 255), int(rgb_color[0] * 255))
+                
+                # Draw the line (no circle at the end to match flow.py)
+                cv2.line(visualization, (x, y), (end_x, end_y), line_color, thickness)
     
-    # Draw all lines
-    for (x1, y1), (x2, y2), magnitude in lines:
-        # Choose color based on direction if no fixed color
-        if color is None:
-            angle = np.arctan2(y2 - y1, x2 - x1)
-            hue = (np.degrees(angle) + 180) / 360.0
-            rgb_color = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-            line_color = (int(rgb_color[2] * 255), int(rgb_color[1] * 255), int(rgb_color[0] * 255))
-        else:
-            line_color = color
-            
-        # Draw line and circle at the end
-        cv2.line(vis, (x1, y1), (x2, y2), line_color, thickness)
-        cv2.circle(vis, (x2, y2), thickness+1, line_color, -1)
-    
-    return vis
+    return visualization
 
 def main():
     args = parse_args()
@@ -710,8 +784,15 @@ def main():
     
     # Extract the new parameters
     show_flow_lines = args.show_flow_lines if hasattr(args, 'show_flow_lines') else False
-    line_density = args.line_density if hasattr(args, 'line_density') else 16
+    line_density = args.line_density if hasattr(args, 'line_density') else 8  # Changed default to 8
     line_thickness = args.line_thickness if hasattr(args, 'line_thickness') else 1
+    line_min_magnitude = args.line_min_magnitude if hasattr(args, 'line_min_magnitude') else 0.3  # Changed default to 0.3
+    line_scale = args.line_scale if hasattr(args, 'line_scale') else 1.5  # Changed default to 1.5
+    
+    # Extract info flags and position settings
+    info_mode = args.info if hasattr(args, 'info') else False
+    info_position = args.info_position if hasattr(args, 'info_position') else 'top-right'
+    histogram_position = args.histogram_position if hasattr(args, 'histogram_position') else 'bottom-left'
     
     # Open video capture
     cap = cv2.VideoCapture(args.input)
@@ -863,13 +944,14 @@ def main():
         
         # If flow lines visualization is enabled, draw them
         if show_flow_lines:
-            # Draw flow lines on active areas (use same min_magnitude threshold as used for trails)
+            # Use updated parameters to match flow.py's style
             display_frame = draw_flow_lines(
                 display_frame, 
                 flow, 
-                magnitude_threshold=args.min_magnitude,
+                min_magnitude=line_min_magnitude,
                 step=line_density,
-                thickness=line_thickness
+                thickness=line_thickness,
+                scale=line_scale
             )
         
         # Create a transparent overlay for all trails
@@ -1002,7 +1084,9 @@ def main():
         if info_mode:
             scene_metrics = calculate_scene_metrics(flow, min_magnitude=args.min_magnitude)
             metrics_history.append(scene_metrics)
-            display_frame = draw_info_overlay(display_frame, scene_metrics, metrics_history)
+            display_frame = draw_info_overlay(display_frame, scene_metrics, metrics_history,
+                                           info_position=info_position,
+                                           histogram_position=histogram_position)
         
         # Add extra debug info if enabled
         if debug_mode:
